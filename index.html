@@ -4,7 +4,10 @@
   <title># Migration: OpenAI Assistants API → Responses API</title>
 </head>
 <body>
-
+<div id="content" class="markdown-body"></div>
+<script>
+  const md = `
+  
 > **Deadline:** Assistants API shut down on August 26, 2026
 > **Migration guide:** https://developers.openai.com/api/docs/guides/migrate-to-responses
 > **Created:** 2026-03-26
@@ -700,5 +703,10 @@ When using `previous_response_id`, all previous input tokens in the chain are bi
 12. [ ] Email processing → verify same flow works
 13. [ ] Template reply context → verify template body is included in initial message
 
+  `;
+
+  document.getElementById("content").innerHTML = marked.parse(md);
+
+</script>
 </body>
 </html>
