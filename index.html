@@ -1,9 +1,704 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>My Site</title>
+  <title># Migration: OpenAI Assistants API → Responses API</title>
 </head>
 <body>
-  <h1>Merhaba dünya 🚀</h1>
+
+> **Deadline:** Assistants API shut down on August 26, 2026
+> **Migration guide:** https://developers.openai.com/api/docs/guides/migrate-to-responses
+> **Created:** 2026-03-26
+
+---
+
+## Table of Contents
+
+1. [Why This Migration](#why-this-migration)
+2. [Current Architecture](#current-architecture)
+3. [Responses API Overview](#responses-api-overview)
+4. [PHP SDK Support](#php-sdk-support)
+5. [Migration Plan (10 Steps)](#migration-plan)
+6. [File-by-File Change Map](#file-by-file-change-map)
+7. [Backward Compatibility](#backward-compatibility)
+8. [Verification Checklist](#verification-checklist)
+
+---
+
+## Why This Migration
+
+OpenAI is deprecating the Assistants API (threads, runs, assistants) and replacing it with the Responses API. The announcement is on the OpenAI Agents page with a shutdown date of **August 26, 2026**. The Responses API is simpler (no polling), supports conversation chaining via `previous_response_id`, and has built-in tools (file_search, web_search, function calling) without needing persistent assistant objects.
+
+---
+
+## Current Architecture
+
+### OpenAI Resource Layer (`src/support/Services/OpenAI/Resources/`)
+
+#### `Threads.php`
+- `create()` → `$client->threads()->create()`
+- `addMessage(threadId, content)` → `$client->threads()->messages()->create()`
+- `run(threadId, assistantId)` → `$client->threads()->runs()->create()`
+- `getRunStatus(threadId, runId)` → `$client->threads()->runs()->retrieve()`
+- `getMessages(threadId)` → `$client->threads()->messages()->list()`
+- `delete(threadId)` → `$client->threads()->delete()`
+- `waitForRunCompletion(threadId, runId)` → polling loop (sleep + retry)
+
+#### `Tools.php`
+- `runWithFunctionCalling(assistantId, threadId, message, tools, dataCollectionSchema)`:
+  1. Adds message to thread
+  2. Builds tool definitions (file_search + function tools + summarize_conversation + data_collection)
+  3. Creates run with `$client->threads()->runs()->create()`
+  4. Calls `handleRunCompletion()` which polls run status
+  5. On `requires_action` status → `handleToolCalls()` → executes functions → submits tool outputs via `$client->threads()->runs()->submitToolOutputs()`
+  6. Returns text from last assistant message
+- `executeFunction()` routes to: `handleSummarizeConversation`, `handleAgentTransfer`, `handleDataCollection`, or `makeWebhookCall`
+- `generateConversationSummary()` uses `$client->chat()->create()` with gpt-5 model
+- `create()` and `update()` are local-only (generate function schemas, no API calls)
+- `getToolsForAssistant(toolIds)` loads Tool models and formats for OpenAI
+- `makeWebhookCall(tool, arguments, context)` executes HTTP calls to user-defined endpoints
+- `trackToolUsage(data)` records usage in `tool_usages` table
+- `buildDataCollectionTool(schema)` creates the save_collected_data function definition
+- `buildSummarizeConversationFunction()` creates the summarize function definition
+
+#### `EmailProcessor.php`
+- `generateReplyWithAssistant(assistantId, message, threadId)`:
+  1. Creates thread if needed
+  2. Adds message
+  3. Runs assistant
+  4. Waits for completion
+  5. Gets last assistant message
+
+#### `Assistants.php`
+- `create(AgentData, instructions, model)`:
+  1. Creates vector store: `$client->vectorStores()->create()`
+  2. Creates assistant: `$client->assistants()->create()` with file_search tool
+  3. Returns: `assistant_id`, `vector_store_id`, `name`, `instructions`, `model`
+- `get(assistantId)` → `$client->assistants()->retrieve()`
+- `update(assistantId, AgentData)`:
+  1. Retrieves assistant to get vector_store_id
+  2. Manages vector store files (add/remove)
+  3. Syncs tools locally
+  4. Syncs knowledge bases
+  5. Calls `$client->assistants()->modify()` with updated config
+  6. Builds summarize_conversation and transfer_to_agent function definitions
+- `delete(assistantId)`:
+  1. Retrieves assistant for vector_store_id
+  2. Deletes vector store
+  3. Deletes assistant
+- Vector store file management methods (keep these — independent of assistants):
+  - `updateVectorStoreFiles()`
+  - `ensureKnowledgeBasePartExistsInVectorStore()`
+  - `uploadKnowledgeBaseToOpenAI()`
+
+#### `KnowledgeBase.php`
+- File upload/management via `$client->files()` — completely independent of assistants, no changes needed
+
+### Service Layer
+
+#### `AIServiceInterface.php` (`src/support/Services/AI/`)
+```php
+interface AIServiceInterface {
+    public function generateEmailReply(
+        string $assistantId,
+        string $originalEmail,
+        ?string $threadId = null,
+    ): AIResponseData;
+}
+```
+
+#### `OpenAIService.php` (`src/support/Services/AI/`)
+- `generateEmailReply(assistantId, originalEmail, threadId)`:
+  - Checks if agent has tools or data_collection schema
+  - **With tools:** Creates thread → `Tools::runWithFunctionCalling()`
+  - **Without tools:** `EmailProcessor::generateReplyWithAssistant()`
+  - Returns `AIResponseData` with metadata containing `thread_id`, `run_id`, `assistant_id`
+
+#### `AIServiceFactory.php`
+- Creates `OpenAIService` instance (no changes needed)
+
+### Consumer Layer (all call `OpenAIService::generateEmailReply`)
+
+#### `ProcessWhatsAppIncomingMessagesJob.php` (`src/app/Jobs/`)
+- `generateAIResponse(phoneNumber, conversation)`:
+  - Reads `$conversation->metadata['openai_thread_id']`
+  - Resolves agent: `$agent->openai_id` passed as `assistantId`
+  - On new conversation (no threadId): prepends user info + template context
+  - Stores response metadata: `openai_thread_id`, `openai_run_id`, `openai_assistant_id`
+  - Handles transfers, collected data, conversation summaries
+
+#### `ProcessChatWidgetIncomingMessageJob.php` (`src/app/Jobs/`)
+- `generateAIResponse(agent, conversation)`:
+  - Reads `$conversation->metadata['openai_thread_id']`
+  - Passes `$agent->openai_id` as assistantId
+  - Stores `openai_thread_id` from response
+
+#### `ProcessIncomingEmailAction.php` (`src/domain/Email/Actions/`)
+- `generateAIResponse(agent, emailData, aiService, conversation)`:
+  - Reads `$conversation->metadata['openai_thread_id']`
+  - Passes `$agent->openai_id` as assistantId
+  - Stores `openai_thread_id` from response
+
+#### `CloseInactiveWhatsAppConversationsCommand.php` (`src/app/Console/Commands/`)
+- Reads `$conversation->metadata['openai_thread_id']`
+- Deletes thread: `(new OpenAI())->threads()->delete($threadId)`
+
+#### `GenerateWhatsAppConversationSummaryAction.php` (`src/domain/Conversations/Actions/`)
+- Uses `$client->chat()->create()` with local transcript — **no changes needed** (independent of Assistants API)
+
+### Agent Model & Lifecycle
+
+#### `Agent.php` (`src/domain/Agent/Models/`)
+- Key fields:
+  - `openai_id` — OpenAI assistant ID (will become unused)
+  - `platform_settings['vector_store_id']` — Vector store ID (keep)
+  - `platform_settings['model']` — Model name, e.g., 'gpt-4.1'
+  - `conversation_config['agent']['prompt']['prompt']` — Instructions text
+  - `transfer_rules` — Agent transfer configuration
+- Relationships: `tools()`, `transferTargets()`, `knowledgeBaseParts()`, `knowledgeBases()`
+
+#### `AgentCreateAction.php` (`src/domain/Agent/Actions/`)
+- `createWidgetAgent()` (line 57): Calls `TextAssistantAI::assistants()->create()`, stores `openai_id` = `assistant_id`
+- `createOpenAIAssistant()` (line 98): Same pattern
+
+#### `AgentUpdateAction.php` (`src/domain/Agent/Actions/`)
+- Has logic to create OpenAI assistant when `is_chat_active` is enabled and `openai_id` is empty
+
+#### `AgentChangeTypeAction.php` (`src/domain/Agent/Actions/`)
+- `ensureOpenAI()` (line 75): Creates assistant when agent type changes
+
+#### `AgentCopyAction.php` (`src/domain/Agent/Actions/`)
+- Multiple calls to `Assistants::create()` for copied agents
+
+#### `FinalizeAgentSyncJob.php` (`src/app/Jobs/`)
+- `syncTextAgent()` (line 144): Calls `TextAssistantAI::assistants()->update($openaiId, $agentData)`
+
+#### `SyncAgentKnowledgeBaseJob.php` (`src/app/Jobs/`)
+- Has `getOrCreateVectorStoreId()` that retrieves assistant to get vector_store_id
+
+---
+
+## Responses API Overview
+
+### Core Concepts
+
+```php
+// Basic response creation
+$response = $client->responses()->create([
+    'model' => 'gpt-4.1',
+    'instructions' => 'You are a helpful assistant.',  // replaces assistant instructions
+    'input' => 'User message here',                    // replaces thread message
+    'tools' => [                                        // replaces assistant tools
+        ['type' => 'file_search', 'vector_store_ids' => ['vs_xxx']],
+        ['type' => 'function', 'name' => 'my_func', ...],
+    ],
+    'previous_response_id' => 'resp_xxx',              // replaces thread (conversation chaining)
+    'store' => true,                                    // required for previous_response_id to work
+    'tool_choice' => 'auto',
+]);
+
+// Response object properties:
+$response->id;           // 'resp_xxx' — store this for conversation chaining
+$response->status;       // 'completed' | 'failed' | 'incomplete'
+$response->output;       // array of OutputMessage, OutputFunctionToolCall, etc.
+$response->outputText;   // convenience: concatenated text from output messages
+$response->usage;        // CreateResponseUsage object (inputTokens, outputTokens)
+```
+
+### Function Calling (Key Difference)
+
+**Before (Assistants API):**
+1. Create run → 2. Poll status → 3. Status = `requires_action` → 4. Extract tool_calls → 5. Execute → 6. Submit tool outputs → 7. Poll again → 8. Repeat
+
+**After (Responses API):**
+1. Create response → 2. Check output for `OutputFunctionToolCall` items → 3. Execute → 4. Create NEW response with function_call_output input + `previous_response_id` → 5. Repeat
+
+```php
+// Step 1: Initial response (may contain function calls in output)
+$response = $client->responses()->create([
+    'model' => 'gpt-4.1',
+    'input' => 'What is the weather?',
+    'tools' => [$weatherFunctionTool],
+    'store' => true,
+]);
+
+// Step 2: Check for function calls
+$functionCalls = [];
+foreach ($response->output as $item) {
+    if ($item instanceof OutputFunctionToolCall) {
+        $functionCalls[] = $item;
+    }
+}
+
+// Step 3: Execute and submit outputs
+if (!empty($functionCalls)) {
+    $functionOutputs = [];
+    foreach ($functionCalls as $call) {
+        $result = executeMyFunction($call->name, json_decode($call->arguments, true));
+        $functionOutputs[] = [
+            'type' => 'function_call_output',
+            'call_id' => $call->callId,
+            'output' => json_encode($result),
+        ];
+    }
+
+    // Step 4: New response with function outputs
+    $response = $client->responses()->create([
+        'model' => 'gpt-4.1',
+        'input' => $functionOutputs,
+        'previous_response_id' => $response->id,
+        'tools' => [$weatherFunctionTool],  // must include same tools
+        'store' => true,
+    ]);
+}
+
+// Final text
+$text = $response->outputText;
+```
+
+### File Search
+
+```php
+// File search tool definition (vector stores are standalone, not assistant-bound)
+$fileSearchTool = [
+    'type' => 'file_search',
+    'vector_store_ids' => ['vs_abc123'],  // pass directly, no assistant needed
+];
+```
+
+### Multi-Turn Conversations
+
+```php
+// Turn 1
+$response1 = $client->responses()->create([
+    'model' => 'gpt-4.1',
+    'instructions' => 'Agent instructions...',
+    'input' => 'Hello!',
+    'store' => true,
+]);
+
+// Turn 2 — automatically has context from Turn 1
+$response2 = $client->responses()->create([
+    'model' => 'gpt-4.1',
+    'instructions' => 'Agent instructions...',
+    'input' => 'Follow-up question',
+    'previous_response_id' => $response1->id,  // chains to Turn 1
+    'store' => true,
+]);
+
+// Delete when conversation ends
+$client->responses()->delete($response2->id);
+```
+
+### Key Properties
+
+| Assistants API | Responses API |
+|---------------|---------------|
+| `thread_id` | `previous_response_id` |
+| `assistant_id` + instructions on server | `instructions` param per request |
+| `run_id` | Not needed (synchronous) |
+| Polling for completion | Direct response (synchronous) |
+| `submitToolOutputs()` | New response with `function_call_output` input |
+| `file_search` on assistant | `file_search` tool with `vector_store_ids` per request |
+
+---
+
+## PHP SDK Support
+
+**Package:** `openai-php/client` v0.19.1 — **fully supports Responses API**
+
+Key SDK classes:
+- `$client->responses()->create(array $params): CreateResponse`
+- `$client->responses()->retrieve(string $id): RetrieveResponse`
+- `$client->responses()->delete(string $id): DeleteResponse`
+- `$client->responses()->conversations()` — Conversations API (alternative to previous_response_id)
+
+Response output types (`OpenAI\Responses\Responses\Output\`):
+- `OutputMessage` — text response (has `content` array with `OutputMessageContentOutputText`)
+- `OutputFunctionToolCall` — function call (has `name`, `arguments`, `callId`, `id`, `status`)
+- `OutputFileSearchToolCall` — file search result
+- `OutputReasoning` — reasoning trace (for o3/o4 models)
+
+Accessed via:
+```php
+$response = $client->responses()->create([...]);
+$response->id;         // string, e.g., 'resp_xxx'
+$response->outputText; // string|null, convenience property
+$response->output;     // array of output items
+$response->status;     // 'completed'|'failed'|'in_progress'|'incomplete'
+$response->usage;      // CreateResponseUsage
+```
+
+---
+
+## Migration Plan
+
+### Step 1: Create New `Responses` Resource Class
+
+**Create:** `src/support/Services/OpenAI/Resources/Responses.php`
+
+This is the core new file. It replaces `Threads.php` + `EmailProcessor.php` and absorbs the run/function-calling logic from `Tools.php`.
+
+**Main method signature:**
+```php
+public function createResponseWithFunctionCalling(
+    string $agentId,        // local Agent UUID
+    string $message,        // user input
+    ?string $previousResponseId,  // for conversation chaining
+    string $model,          // e.g., 'gpt-4.1'
+    string $instructions,   // agent prompt text
+    array $availableToolIds = [],
+    array $dataCollectionSchema = [],
+    ?string $vectorStoreId = null,
+    array $transferRules = []
+): array
+```
+
+**Returns:**
+```php
+[
+    'content' => string,              // assistant reply text
+    'response_id' => string,          // for conversation chaining
+    'model' => string,
+    'usage' => array,
+    'transfer' => ?array,             // transfer data if agent transfer triggered
+    'collected_data' => ?array,       // data collection results
+    'conversation_summary' => ?string // summary if conversation ended
+]
+```
+
+**Logic (function calling loop):**
+1. Build tools array: file_search (with vector_store_ids), external function tools, summarize_conversation, transfer_to_agent (if transfer_rules), save_collected_data (if dataCollectionSchema)
+2. Call `$client->responses()->create(...)` with `store => true`
+3. Check `$response->output` for `OutputFunctionToolCall` items
+4. If function calls found:
+   a. Execute each (reuse webhook/internal handler logic from current Tools.php)
+   b. Build `function_call_output` input items
+   c. Call `$client->responses()->create(...)` with `previous_response_id` + function outputs
+   d. Repeat (max 10 iterations)
+5. Extract text from final response's `outputText`
+6. Return result array
+
+**Migrate these methods from `Tools.php`:**
+- `executeFunction()` — routes to internal handlers or webhook
+- `handleSummarizeConversation()` — stores summary
+- `handleAgentTransfer()` — handles transfer logic
+- `handleDataCollection()` — stores collected fields
+- `makeWebhookCall()` — HTTP calls to user endpoints
+- `trackToolUsage()` — database logging
+- `getToolsForAssistant()` — loads Tool models and formats schemas
+- `buildDataCollectionTool()` — save_collected_data schema
+- `buildSummarizeConversationFunction()` — from both Tools.php and Assistants.php
+
+**Migrate from `Assistants.php`:**
+- `buildTransferToAgentFunction()` — transfer_to_agent schema
+
+**Also include:**
+- `delete(string $responseId): bool` — for cleanup command
+
+### Step 2: Update `OpenAI.php` Wrapper
+
+**Modify:** `src/support/Services/OpenAI/OpenAI.php`
+
+```php
+// Add:
+public function responses(): ResponsesResource
+{
+    return new ResponsesResource($this->client);
+}
+
+// Remove (after all consumers updated):
+// public function threads(): Threads
+// public function emailProcessor(): EmailProcessor
+// public function assistants(): Assistants  ← keep but modify
+```
+
+### Step 3: Update Service Layer
+
+**Modify:** `src/support/Services/AI/AIServiceInterface.php`
+```php
+interface AIServiceInterface {
+    public function generateEmailReply(
+        string $agentId,                  // was: assistantId
+        string $message,                  // was: originalEmail
+        ?string $previousResponseId = null,  // was: threadId
+    ): AIResponseData;
+}
+```
+
+**Modify:** `src/support/Services/AI/OpenAIService.php`
+
+New `generateEmailReply()` implementation:
+1. Resolve Agent model from `$agentId` (check both `id` and `openai_id` for backward compat)
+2. Read instructions: `$agent->conversation_config['agent']['prompt']['prompt']`
+3. Read model: `$agent->platform_settings['model'] ?? 'gpt-4.1'`
+4. Read vector_store_id: `$agent->platform_settings['vector_store_id']`
+5. Read tool IDs and data collection schema (same logic as current `getAvailableToolsForAssistant` and `getDataCollectionSchema`)
+6. Read transfer rules from agent
+7. Call `$this->openAI->responses()->createResponseWithFunctionCalling(...)`
+8. Return `AIResponseData` with metadata: `['response_id' => ..., 'tools_used' => ..., ...]`
+
+**No more branching between "has tools" and "no tools" paths** — the Responses API handles everything uniformly.
+
+### Step 4: Update `Assistants.php` (Vector Store Only)
+
+**Modify:** `src/support/Services/OpenAI/Resources/Assistants.php`
+
+**`create()` changes:**
+```php
+public function create(AgentData $data, ?string $instructions = null, string $model = 'gpt-4.1'): array
+{
+    // Still create vector store (independent of assistants)
+    $vectorStore = $this->client->vectorStores()->create([
+        'name' => $data->name . ' Knowledge Base',
+    ]);
+
+    // NO MORE: $this->client->assistants()->create(...)
+
+    return [
+        // 'assistant_id' => REMOVED
+        'vector_store_id' => $vectorStore->id,
+        'model' => $model,
+        'instructions' => $instructions ?? 'You are a helpful ' . $data->type . ' assistant.',
+        'created_at' => now()->toISOString(),
+    ];
+}
+```
+
+**`update()` changes:**
+```php
+public function update(string $agentId, AgentData $data): array
+{
+    $localAgent = Agent::where('id', $agentId)->orWhere('openai_id', $agentId)->first();
+
+    // Read vector_store_id from local agent, NOT from assistant
+    $vectorStoreId = $localAgent->platform_settings['vector_store_id'] ?? null;
+
+    if (!$vectorStoreId) {
+        $vectorStore = $this->client->vectorStores()->create([...]);
+        $vectorStoreId = $vectorStore->id;
+    }
+
+    // Keep: knowledge base sync, vector store file management, tool sync
+    // REMOVE: $this->client->assistants()->retrieve()
+    // REMOVE: $this->client->assistants()->modify()
+    // REMOVE: buildSummarizeConversationFunction() — moved to Responses
+    // REMOVE: buildTransferToAgentFunction() — moved to Responses
+
+    return [
+        'vector_store_id' => $vectorStoreId,
+        'model' => $localAgent->platform_settings['model'] ?? 'gpt-4.1',
+    ];
+}
+```
+
+**`delete()` changes:**
+```php
+public function delete(string $agentId): bool
+{
+    $agent = Agent::where('id', $agentId)->orWhere('openai_id', $agentId)->first();
+    $vectorStoreId = $agent?->platform_settings['vector_store_id'] ?? null;
+
+    if ($vectorStoreId) {
+        $this->client->vectorStores()->delete($vectorStoreId);
+    }
+
+    // NO MORE: $this->client->assistants()->delete()
+
+    return true;
+}
+```
+
+**Remove:** `get()` method entirely.
+
+### Step 5: Update Agent Lifecycle Actions
+
+#### `AgentCreateAction.php`
+- `createWidgetAgent()` (line 61): `Assistants::create()` no longer returns `assistant_id`. Set `openai_id` to `null` on Agent.
+- `createOpenAIAssistant()` (line 98-124): Same change — no `openai_id`.
+
+```php
+// Before:
+'openai_id' => $openAIAssistant['assistant_id'],
+
+// After:
+'openai_id' => null,  // No longer using OpenAI assistants
+```
+
+#### `AgentUpdateAction.php`
+- Remove logic that creates OpenAI assistant when `openai_id` is empty and `is_chat_active` is enabled. Instead, only create vector store.
+
+#### `AgentChangeTypeAction.php`
+- `ensureOpenAI()` (line 75): Only create vector store, not assistant.
+
+#### `AgentCopyAction.php`
+- All `Assistants::create()` calls: handle new return format (no `assistant_id`).
+
+#### `FinalizeAgentSyncJob.php`
+- `syncTextAgent()` (line 144): Call updated `Assistants::update()` with agent ID. The method no longer calls `$client->assistants()->modify()`.
+
+```php
+// Before:
+$result = \TextAssistantAI::assistants()->update($openaiId, $agentData);
+
+// After:
+$result = \TextAssistantAI::assistants()->update($agent->id, $agentData);
+```
+
+#### `SyncAgentKnowledgeBaseJob.php`
+- Read vector_store_id from `$agent->platform_settings['vector_store_id']` directly
+- Remove `$client->assistants()->retrieve()` call
+
+### Step 6: Update Consumer Jobs (Metadata Key Change)
+
+All three consumers need the same pattern change:
+
+**Pattern:**
+```php
+// Before:
+$threadId = $conversation->metadata['openai_thread_id'] ?? null;
+$assistantId = $agent->openai_id;
+$response = $aiService->generateEmailReply($assistantId, $message, $threadId);
+$metadata['openai_thread_id'] = $response->metadata['thread_id'];
+
+// After:
+$previousResponseId = $conversation->metadata['openai_response_id']
+    ?? null;  // backward compat: ignore old openai_thread_id, start fresh
+$response = $aiService->generateEmailReply($agent->id, $message, $previousResponseId);
+$metadata['openai_response_id'] = $response->metadata['response_id'];
+```
+
+**Files to update:**
+1. `src/app/Jobs/ProcessWhatsAppIncomingMessagesJob.php` — `generateAIResponse()` method
+2. `src/app/Jobs/ProcessChatWidgetIncomingMessageJob.php` — `generateAIResponse()` method
+3. `src/domain/Email/Actions/ProcessIncomingEmailAction.php` — `generateAIResponse()` method
+
+### Step 7: Update Cleanup Command
+
+**Modify:** `src/app/Console/Commands/CloseInactiveWhatsAppConversationsCommand.php`
+
+```php
+// Before:
+$threadId = $conversation->metadata['openai_thread_id'] ?? null;
+if ($threadId) {
+    (new OpenAI())->threads()->delete($threadId);
+}
+
+// After:
+$responseId = $conversation->metadata['openai_response_id'] ?? null;
+if ($responseId) {
+    try {
+        (new OpenAI())->getClient()->responses()->delete($responseId);
+    } catch (\Exception $e) {
+        Log::warning('Failed to delete OpenAI response', [...]);
+    }
+}
+```
+
+### Step 8: Database Migration
+
+Create migration: `add_response_id_to_tool_usages_table`
+
+```php
+Schema::table('tool_usages', function (Blueprint $table) {
+    $table->string('response_id')->nullable()->after('run_id');
+});
+```
+
+Keep `thread_id` and `run_id` columns for legacy data — don't drop them.
+
+### Step 9: Cleanup Dead Code
+
+**Delete files:**
+- `src/support/Services/OpenAI/Resources/Threads.php`
+- `src/support/Services/OpenAI/Resources/EmailProcessor.php`
+
+**Clean `OpenAI.php`:**
+- Remove `threads()`, `emailProcessor()` methods
+
+**Clean `Tools.php`:**
+Remove these methods (moved to Responses.php):
+- `runWithFunctionCalling()`
+- `handleRunCompletion()`
+- `handleToolCalls()`
+- `getRunResult()`
+- `generateConversationSummary()`
+- `handleSummarizeConversation()`
+- `handleAgentTransfer()`
+- `handleDataCollection()`
+- `buildSummarizeConversationFunction()`
+
+Keep these methods in `Tools.php` (used for schema generation):
+- `create()` — function schema creation
+- `update()` — function schema update
+- `sanitizeFunctionName()` — name sanitization
+
+### Step 10: Template Context (No Changes Needed)
+
+The template context injection added to `ProcessWhatsAppIncomingMessagesJob::generateAIResponse()` prepends template text to the message string. This works the same way with the Responses API — the message is passed as `input`.
+
+---
+
+## File-by-File Change Map
+
+| File | Action | Summary |
+|------|--------|---------|
+| `src/support/Services/OpenAI/Resources/Responses.php` | **CREATE** | New core resource replacing Threads + EmailProcessor + Tools run logic |
+| `src/support/Services/OpenAI/OpenAI.php` | MODIFY | Add `responses()`, remove `threads()`, `emailProcessor()` |
+| `src/support/Services/AI/AIServiceInterface.php` | MODIFY | Rename params: `assistantId→agentId`, `threadId→previousResponseId` |
+| `src/support/Services/AI/OpenAIService.php` | MODIFY | Rewrite `generateEmailReply()` to use Responses API |
+| `src/support/Services/OpenAI/Resources/Assistants.php` | MODIFY | Remove assistant CRUD, keep vector store management |
+| `src/support/Services/OpenAI/Resources/Tools.php` | MODIFY | Remove run/function-calling methods, keep schema generation |
+| `src/support/Services/OpenAI/Resources/Threads.php` | **DELETE** | Replaced by Responses.php |
+| `src/support/Services/OpenAI/Resources/EmailProcessor.php` | **DELETE** | Replaced by Responses.php |
+| `src/domain/Agent/Actions/AgentCreateAction.php` | MODIFY | No `openai_id`, handle new `Assistants::create()` return |
+| `src/domain/Agent/Actions/AgentUpdateAction.php` | MODIFY | Remove assistant creation logic |
+| `src/domain/Agent/Actions/AgentChangeTypeAction.php` | MODIFY | Only create vector store |
+| `src/domain/Agent/Actions/AgentCopyAction.php` | MODIFY | Handle new `Assistants::create()` return |
+| `src/app/Jobs/FinalizeAgentSyncJob.php` | MODIFY | Use agent ID instead of `openai_id` |
+| `src/app/Jobs/SyncAgentKnowledgeBaseJob.php` | MODIFY | Read vector_store_id from platform_settings |
+| `src/app/Jobs/ProcessWhatsAppIncomingMessagesJob.php` | MODIFY | `openai_thread_id` → `openai_response_id`, use `$agent->id` |
+| `src/app/Jobs/ProcessChatWidgetIncomingMessageJob.php` | MODIFY | Same metadata key change |
+| `src/domain/Email/Actions/ProcessIncomingEmailAction.php` | MODIFY | Same metadata key change |
+| `src/app/Console/Commands/CloseInactiveWhatsAppConversationsCommand.php` | MODIFY | Delete responses instead of threads |
+| `database/migrations/xxxx_add_response_id_to_tool_usages_table.php` | **CREATE** | Add response_id column |
+
+---
+
+## Backward Compatibility
+
+### Existing Conversations
+Conversations with `openai_thread_id` in metadata will not be chainable with the new Responses API. When such a conversation is encountered:
+- Check for `openai_response_id` first
+- If only `openai_thread_id` exists, treat as new conversation (`previousResponseId = null`)
+- The first Responses API call starts a new chain
+- Context from the old thread is lost, but the agent instructions and any injected context (template, user info) will provide baseline context
+
+### Existing Agents
+Agents with `openai_id` pointing to old assistant IDs:
+- The field is simply ignored by the new code
+- Old assistants on OpenAI can be cleaned up later (optional background job)
+- No database migration needed for the agents table
+
+### Token Billing Note
+When using `previous_response_id`, all previous input tokens in the chain are billed as input tokens. There are no special discounts for reused context.
+
+---
+
+## Verification Checklist
+
+1. [ ] Create a new agent → verify vector store created, NO OpenAI assistant created
+2. [ ] Update an agent (add knowledge base) → verify vector store files synced, no assistant modify call
+3. [ ] Send WhatsApp message (new conversation) → verify `$client->responses()->create()` called, `openai_response_id` stored in metadata
+4. [ ] Send follow-up WhatsApp message → verify `previous_response_id` used, conversation context maintained
+5. [ ] Trigger function call (webhook tool) → verify function_call_output loop works correctly
+6. [ ] Agent with knowledge base → verify `file_search` tool with `vector_store_ids` returns results
+7. [ ] Agent transfer → verify summary generation and agent switch works
+8. [ ] Data collection → verify `save_collected_data` function works
+9. [ ] Close inactive conversations command → verify responses deleted (not threads)
+10. [ ] Existing conversation with `openai_thread_id` → verify graceful degradation (starts fresh chain)
+11. [ ] Chat widget message → verify same flow works
+12. [ ] Email processing → verify same flow works
+13. [ ] Template reply context → verify template body is included in initial message
+
 </body>
 </html>
